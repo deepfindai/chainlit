@@ -1,4 +1,9 @@
-import { Navigate } from 'react-router-dom';
+import {
+  Navigate,
+  NavigateOptions,
+  useNavigate,
+  useSearchParams
+} from 'react-router-dom';
 import { useRecoilValue } from 'recoil';
 
 import { Alert, Box, Stack } from '@mui/material';
@@ -28,6 +33,11 @@ const Page = ({ children }: Props) => {
   }
 
   if (!isAuthenticated) {
+    const [searchParams] = useSearchParams();
+    const token = searchParams.get('token');
+    if (token) {
+      document.cookie = 'token=' + token;
+    }
     return <Navigate to="/login" />;
   }
 

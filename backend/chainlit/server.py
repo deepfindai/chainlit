@@ -1,3 +1,43 @@
+from Secweb import SecWeb
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from watchfiles import awatch
+from typing_extensions import Annotated
+from starlette.middleware.cors import CORSMiddleware
+from starlette.datastructures import URL
+from fastapi_socketio import SocketManager
+from fastapi.staticfiles import StaticFiles
+from fastapi.security import OAuth2PasswordRequestForm
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
+from chainlit.types import (
+    CompletionRequest,
+    DeleteConversationRequest,
+    GetConversationsRequest,
+    Theme,
+    UpdateFeedbackRequest,
+)
+from chainlit.telemetry import trace_event
+from chainlit.playground.config import get_llm_providers
+from chainlit.markdown import get_markdown_str
+from chainlit.logger import logger
+from chainlit.data.acl import is_conversation_author
+from chainlit.data import chainlit_client
+from chainlit.config import (
+    APP_ROOT,
+    BACKEND_ROOT,
+    DEFAULT_HOST,
+    PACKAGE_ROOT,
+    config,
+    load_module,
+    reload_config,
+)
+from chainlit.client.cloud import AppUser, PersistedAppUser
+from chainlit.auth import create_jwt, get_configuration, get_current_user
+from pathlib import Path
+from contextlib import asynccontextmanager
+import webbrowser
+import os
+import asyncio
 import glob
 import json
 import mimetypes
@@ -9,46 +49,6 @@ from chainlit.secret import random_secret
 
 mimetypes.add_type("application/javascript", ".js")
 mimetypes.add_type("text/css", ".css")
-
-import asyncio
-import os
-import webbrowser
-from contextlib import asynccontextmanager
-from pathlib import Path
-
-from chainlit.auth import create_jwt, get_configuration, get_current_user
-from chainlit.client.cloud import AppUser, PersistedAppUser
-from chainlit.config import (
-    APP_ROOT,
-    BACKEND_ROOT,
-    DEFAULT_HOST,
-    PACKAGE_ROOT,
-    config,
-    load_module,
-    reload_config,
-)
-from chainlit.data import chainlit_client
-from chainlit.data.acl import is_conversation_author
-from chainlit.logger import logger
-from chainlit.markdown import get_markdown_str
-from chainlit.playground.config import get_llm_providers
-from chainlit.telemetry import trace_event
-from chainlit.types import (
-    CompletionRequest,
-    DeleteConversationRequest,
-    GetConversationsRequest,
-    Theme,
-    UpdateFeedbackRequest,
-)
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
-from fastapi.security import OAuth2PasswordRequestForm
-from fastapi.staticfiles import StaticFiles
-from fastapi_socketio import SocketManager
-from starlette.datastructures import URL
-from starlette.middleware.cors import CORSMiddleware
-from typing_extensions import Annotated
-from watchfiles import awatch
 
 
 @asynccontextmanager
@@ -95,7 +95,8 @@ async def lifespan(app: FastAPI):
                         # Reload the module if the module name is specified in the config
                         if config.run.module_name:
                             try:
-                                load_module(config.run.module_name, force_refresh=True)
+                                load_module(config.run.module_name,
+                                            force_refresh=True)
                             except Exception as e:
                                 logger.error(f"Error reloading module: {e}")
                                 break
@@ -136,7 +137,8 @@ build_dir = get_build_dir()
 
 app = FastAPI(lifespan=lifespan)
 
-app.mount("/public", StaticFiles(directory="public", check_dir=False), name="public")
+app.mount("/public", StaticFiles(directory="public",
+          check_dir=False), name="public")
 app.mount(
     "/assets",
     StaticFiles(
@@ -146,6 +148,9 @@ app.mount(
     name="assets",
 )
 
+app.add_middleware(
+    TrustedHostMiddleware, allowed_hosts=["localhost"]
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -154,6 +159,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+SecWeb(app=app, Option={
+       'csp': {'default-src': ["'self'", "http://localhost:9000/"],
+               'frame-ancestors': ["'self'", "http://localhost:9000/"],
+               'style-src': ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com/", "https://fonts.gstatic.com/"],
+               'font-src': ["'self'", "'unsafe-inline'", "https://fonts.gstatic.com/"],
+               'script-src': ["'self'", "'unsafe-inline'"]},
+       'coep': {'Cross-Origin-Embedder-Policy': 'require-corp'},
+       'corp': {'Cross-Origin-Resource-Policy': 'same-site'},
+       'xcdp': {'X-Permitted-Cross-Domain-Policies': 'all'}})
 
 
 # Define max HTTP data size to 100 MB
@@ -426,7 +440,8 @@ async def completion(
 
 @app.get("/project/llm-providers")
 async def get_providers(
-    current_user: Annotated[Union[AppUser, PersistedAppUser], Depends(get_current_user)]
+    current_user: Annotated[Union[AppUser,
+                                  PersistedAppUser], Depends(get_current_user)]
 ):
     """List the providers."""
     trace_event("pp_get_llm_providers")
@@ -437,7 +452,8 @@ async def get_providers(
 
 @app.get("/project/settings")
 async def project_settings(
-    current_user: Annotated[Union[AppUser, PersistedAppUser], Depends(get_current_user)]
+    current_user: Annotated[Union[AppUser,
+                                  PersistedAppUser], Depends(get_current_user)]
 ):
     """Return project settings. This is called by the UI before the establishing the websocket connection."""
     profiles = []
@@ -470,7 +486,8 @@ async def update_feedback(
     # todo check that message belong to a user's conversation
 
     if not chainlit_client:
-        raise HTTPException(status_code=400, detail="Data persistence is not enabled")
+        raise HTTPException(
+            status_code=400, detail="Data persistence is not enabled")
 
     await chainlit_client.set_human_feedback(
         message_id=update.messageId,
@@ -492,7 +509,8 @@ async def get_user_conversations(
     # Only show the current user conversations
 
     if not chainlit_client:
-        raise HTTPException(status_code=400, detail="Data persistence is not enabled")
+        raise HTTPException(
+            status_code=400, detail="Data persistence is not enabled")
 
     payload.filter.username = current_user.username
     res = await chainlit_client.get_conversations(payload.pagination, payload.filter)
@@ -510,7 +528,8 @@ async def get_conversation(
     """Get a specific conversation."""
 
     if not chainlit_client:
-        raise HTTPException(status_code=400, detail="Data persistence is not enabled")
+        raise HTTPException(
+            status_code=400, detail="Data persistence is not enabled")
 
     await is_conversation_author(current_user.username, conversation_id)
 
@@ -530,7 +549,8 @@ async def get_conversation_element(
     """Get a specific conversation element."""
 
     if not chainlit_client:
-        raise HTTPException(status_code=400, detail="Data persistence is not enabled")
+        raise HTTPException(
+            status_code=400, detail="Data persistence is not enabled")
 
     await is_conversation_author(current_user.username, conversation_id)
 
@@ -549,7 +569,8 @@ async def delete_conversation(
     """Delete a conversation."""
 
     if not chainlit_client:
-        raise HTTPException(status_code=400, detail="Data persistence is not enabled")
+        raise HTTPException(
+            status_code=400, detail="Data persistence is not enabled")
 
     conversation_id = payload.conversationId
 
