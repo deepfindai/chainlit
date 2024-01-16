@@ -3,10 +3,10 @@ from datetime import datetime, timedelta
 from typing import Any, Dict
 
 import jwt
-from chainlit.client.cloud import AppUser
 from chainlit.config import config
-from chainlit.data import chainlit_client
+from chainlit.data import get_data_layer
 from chainlit.oauth_providers import get_configured_oauth_providers
+from chainlit.user import User
 from fastapi import Depends, HTTPException
 from fastapi.security import OAuth2PasswordBearer
 
@@ -20,7 +20,7 @@ def get_jwt_secret():
 def ensure_jwt_secret():
     if require_login() and get_jwt_secret() is None:
         raise ValueError(
-            "You must provide a JWT secret in the environment to use password authentication. Run `chainlit create-secret` to generate one."
+            "You must provide a JWT secret in the environment to use authentication. Run `chainlit create-secret` to generate one."
         )
 
 
@@ -30,7 +30,8 @@ def is_oauth_enabled():
 
 def require_login():
     return (
-        config.code.password_auth_callback is not None
+        bool(os.environ.get("CHAINLIT_CUSTOM_AUTH"))
+        or config.code.password_auth_callback is not None
         or config.code.header_auth_callback is not None
         or is_oauth_enabled()
     )
@@ -47,7 +48,7 @@ def get_configuration():
     }
 
 
-def create_jwt(data: AppUser) -> str:
+def create_jwt(data: User) -> str:
     to_encode = data.to_dict()  # type: Dict[str, Any]
     to_encode.update(
         {
@@ -67,21 +68,20 @@ async def authenticate_user(token: str = Depends(reuseable_oauth)):
             options={"verify_signature": True},
         )
         del dict["exp"]
-        app_user = AppUser(**dict)
+        user = User(**dict)
     except Exception as e:
         raise HTTPException(status_code=401, detail="Invalid authentication token")
-
-    if chainlit_client:
+    if data_layer := get_data_layer():
         try:
-            persisted_app_user = await chainlit_client.get_app_user(app_user.username)
+            persisted_user = await data_layer.get_user(user.identifier)
         except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
-        if persisted_app_user == None:
+            return user
+        if persisted_user == None:
             raise HTTPException(status_code=401, detail="User does not exist")
 
-        return persisted_app_user
+        return persisted_user
     else:
-        return app_user
+        return user
 
 
 async def get_current_user(token: str = Depends(reuseable_oauth)):

@@ -1,17 +1,16 @@
-from typing import Union
+from typing import List, Union
 
-from fastapi.responses import StreamingResponse
-
+from chainlit.input_widget import InputWidget
 from chainlit.playground.provider import BaseProvider
-from chainlit.prompt import PromptMessage
 from chainlit.sync import make_async
-
-from chainlit import input_widget
+from fastapi.responses import StreamingResponse
+from literalai import GenerationMessage
 
 
 class LangchainGenericProvider(BaseProvider):
     from langchain.chat_models.base import BaseChatModel
     from langchain.llms.base import LLM
+    from langchain.schema import BaseMessage
 
     llm: Union[LLM, BaseChatModel]
 
@@ -20,18 +19,19 @@ class LangchainGenericProvider(BaseProvider):
         id: str,
         name: str,
         llm: Union[LLM, BaseChatModel],
+        inputs: List[InputWidget] = [],
         is_chat: bool = False,
     ):
         super().__init__(
             id=id,
             name=name,
             env_vars={},
-            inputs=[],
+            inputs=inputs,
             is_chat=is_chat,
         )
         self.llm = llm
 
-    def prompt_message_to_langchain_message(self, message: PromptMessage):
+    def prompt_message_to_langchain_message(self, message: GenerationMessage):
         from langchain.schema.messages import (
             AIMessage,
             FunctionMessage,
@@ -46,7 +46,7 @@ class LangchainGenericProvider(BaseProvider):
             return AIMessage(content=content)
         elif message.role == "system":
             return SystemMessage(content=content)
-        elif message.role == "function":
+        elif message.role == "tool":
             return FunctionMessage(
                 content=content, name=message.name if message.name else "function"
             )
@@ -57,20 +57,19 @@ class LangchainGenericProvider(BaseProvider):
         message = super().format_message(message, prompt)
         return self.prompt_message_to_langchain_message(message)
 
-    def message_to_string(self, message: PromptMessage) -> str:
-        return message.to_string()
+    def message_to_string(self, message: BaseMessage) -> str:  # type: ignore[override]
+        return str(message.content)
 
     async def create_completion(self, request):
         from langchain.schema.messages import BaseMessageChunk
 
         await super().create_completion(request)
 
-        messages = self.create_prompt(request)
+        messages = self.create_generation(request)
 
-        stream = make_async(self.llm.stream)
-
-        result = await stream(
-            input=messages,
+        # https://github.com/langchain-ai/langchain/issues/14980
+        result = await make_async(self.llm.stream)(
+            input=messages, **request.generation.settings
         )
 
         def create_event_stream():

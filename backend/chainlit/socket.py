@@ -1,13 +1,14 @@
 import asyncio
 import json
+import uuid
+from datetime import datetime
 from typing import Any, Dict
 
 from chainlit.action import Action
 from chainlit.auth import get_current_user, require_login
-from chainlit.client.cloud import MessageDict
 from chainlit.config import config
 from chainlit.context import init_ws_context
-from chainlit.data import chainlit_client
+from chainlit.data import get_data_layer
 from chainlit.logger import logger
 from chainlit.message import ErrorMessage, Message
 from chainlit.server import socket
@@ -28,6 +29,35 @@ def restore_existing_session(sid, session_id, emit_fn, ask_user_fn):
     return False
 
 
+async def persist_user_session(thread_id: str, metadata: Dict):
+    if data_layer := get_data_layer():
+        await data_layer.update_thread(thread_id=thread_id, metadata=metadata)
+
+
+async def resume_thread(session: WebsocketSession):
+    data_layer = get_data_layer()
+    if not data_layer or not session.user or not session.thread_id_to_resume:
+        return
+    thread = await data_layer.get_thread(thread_id=session.thread_id_to_resume)
+    if not thread:
+        return
+
+    author = thread.get("user").get("identifier") if thread["user"] else None
+    user_is_author = author == session.user.identifier
+
+    if user_is_author:
+        metadata = thread["metadata"] or {}
+        user_sessions[session.id] = metadata.copy()
+        if chat_profile := metadata.get("chat_profile"):
+            session.chat_profile = chat_profile
+        if chat_settings := metadata.get("chat_settings"):
+            session.chat_settings = chat_settings
+
+        trace_event("thread_resumed")
+
+        return thread
+
+
 def load_user_env(user_env):
     # Check user env
     if config.project.user_env:
@@ -45,22 +75,41 @@ def load_user_env(user_env):
     return user_env
 
 
+def build_anon_user_identifier(environ):
+    scope = environ.get("asgi.scope", {})
+    client_ip, _ = scope.get("client")
+    ip = environ.get("HTTP_X_FORWARDED_FOR", client_ip)
+
+    try:
+        headers = scope.get("headers", {})
+        user_agent = next(
+            (v.decode("utf-8") for k, v in headers if k.decode("utf-8") == "user-agent")
+        )
+        return str(uuid.uuid5(uuid.NAMESPACE_DNS, user_agent + ip))
+
+    except StopIteration:
+        return str(uuid.uuid5(uuid.NAMESPACE_DNS, ip))
+
+
 @socket.on("connect")
 async def connect(sid, environ, auth):
     if not config.code.on_chat_start and not config.code.on_message:
-        raise ConnectionRefusedError(
+        logger.warning(
             "You need to configure at least an on_chat_start or an on_message callback"
         )
-
+        return False
     user = None
+    anon_user_identifier = build_anon_user_identifier(environ)
     token = None
+    login_required = require_login()
     try:
         # Check if the authentication is required
-        if require_login():
+        if login_required:
             authorization_header = environ.get("HTTP_AUTHORIZATION")
             token = authorization_header.split(" ")[1] if authorization_header else None
             user = await get_current_user(token=token)
     except Exception as e:
+        logger.info("Authentication failed")
         return False
 
     # Function to send a message to this particular session
@@ -85,8 +134,7 @@ async def connect(sid, environ, auth):
 
     user_env_string = environ.get("HTTP_USER_ENV")
     user_env = load_user_env(user_env_string)
-
-    WebsocketSession(
+    ws_session = WebsocketSession(
         id=session_id,
         socket_id=sid,
         emit=emit_fn,
@@ -95,7 +143,18 @@ async def connect(sid, environ, auth):
         user=user,
         token=token,
         chat_profile=environ.get("HTTP_X_CHAINLIT_CHAT_PROFILE"),
+        thread_id=environ.get("HTTP_X_CHAINLIT_THREAD_ID"),
     )
+
+    if data_layer := get_data_layer():
+        asyncio.create_task(
+            data_layer.create_user_session(
+                id=session_id,
+                started_at=datetime.utcnow().isoformat(),
+                anon_user_id=anon_user_identifier if not user else None,
+                user_id=user.identifier if user else None,
+            )
+        )
 
     trace_event("connection_successful")
     return True
@@ -104,42 +163,53 @@ async def connect(sid, environ, auth):
 @socket.on("connection_successful")
 async def connection_successful(sid):
     context = init_ws_context(sid)
+
     if context.session.restored:
         return
 
+    if context.session.thread_id_to_resume and config.code.on_chat_resume:
+        thread = await resume_thread(context.session)
+        if thread:
+            context.session.has_first_interaction = True
+            await context.emitter.clear_ask()
+            await context.emitter.emit("first_interaction", "resume")
+            await context.emitter.resume_thread(thread)
+            await config.code.on_chat_resume(thread)
+            return
+
     if config.code.on_chat_start:
         """Call the on_chat_start function provided by the developer."""
+        await context.emitter.clear_ask()
         await config.code.on_chat_start()
 
 
 @socket.on("clear_session")
 async def clean_session(sid):
-    if session := WebsocketSession.get(sid):
-        if config.code.on_chat_end:
-            init_ws_context(session)
-            """Call the on_chat_end function provided by the developer."""
-            await config.code.on_chat_end()
-        # Clean up the user session
-        if session.id in user_sessions:
-            user_sessions.pop(session.id)
-        # Clean up the session
-        session.delete()
+    await disconnect(sid, force_clear=True)
 
 
 @socket.on("disconnect")
-async def disconnect(sid):
+async def disconnect(sid, force_clear=False):
     session = WebsocketSession.get(sid)
-    if config.code.on_chat_end and session:
+    if session:
+        if data_layer := get_data_layer():
+            asyncio.create_task(
+                data_layer.update_user_session(
+                    id=session.id,
+                    is_interactive=session.has_first_interaction,
+                    ended_at=datetime.utcnow().isoformat(),
+                )
+            )
+
         init_ws_context(session)
-        """Call the on_chat_end function provided by the developer."""
+
+    if config.code.on_chat_end and session:
         await config.code.on_chat_end()
 
-    if chainlit_client and session and not session.has_user_message:
-        if session.conversation_id:
-            await chainlit_client.delete_conversation(session.conversation_id)
+    if session and session.thread_id and session.has_first_interaction:
+        await persist_user_session(session.thread_id, session.to_persistable())
 
-    async def disconnect_on_timeout(sid):
-        await asyncio.sleep(config.project.session_timeout)
+    def clear():
         if session := WebsocketSession.get(sid):
             # Clean up the user session
             if session.id in user_sessions:
@@ -147,7 +217,14 @@ async def disconnect(sid):
             # Clean up the session
             session.delete()
 
-    asyncio.ensure_future(disconnect_on_timeout(sid))
+    async def clear_on_timeout(sid):
+        await asyncio.sleep(config.project.session_timeout)
+        clear()
+
+    if force_clear:
+        clear()
+    else:
+        asyncio.ensure_future(clear_on_timeout(sid))
 
 
 @socket.on("stop")
@@ -156,7 +233,9 @@ async def stop(sid):
         trace_event("stop_task")
 
         init_ws_context(session)
-        await Message(author="System", content="Task stopped by the user.").send()
+        await Message(
+            author="System", content="Task stopped by the user.", disable_feedback=True
+        ).send()
 
         session.should_stop = True
 
@@ -196,7 +275,8 @@ async def message(sid, payload: UIMessagePayload):
 async def process_action(action: Action):
     callback = config.code.action_callbacks.get(action.name)
     if callback:
-        await callback(action)
+        res = await callback(action)
+        return res
     else:
         logger.warning("No callback found for action %s", action.name)
 
@@ -204,11 +284,25 @@ async def process_action(action: Action):
 @socket.on("action_call")
 async def call_action(sid, action):
     """Handle an action call from the UI."""
-    init_ws_context(sid)
+    context = init_ws_context(sid)
 
     action = Action(**action)
 
-    await process_action(action)
+    try:
+        res = await process_action(action)
+        await context.emitter.send_action_response(
+            id=action.id, status=True, response=res if isinstance(res, str) else None
+        )
+
+    except InterruptedError:
+        await context.emitter.send_action_response(
+            id=action.id, status=False, response="Action interrupted by the user"
+        )
+    except Exception as e:
+        logger.exception(e)
+        await context.emitter.send_action_response(
+            id=action.id, status=False, response="An error occured"
+        )
 
 
 @socket.on("chat_settings_change")

@@ -1,3 +1,16 @@
+from fastapi import (
+    Depends,
+    FastAPI,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+    status,
+)
+from chainlit.user import PersistedUser, User
+from chainlit.data.acl import is_thread_author
+from chainlit.data import get_data_layer
 from Secweb import SecWeb
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from watchfiles import awatch
@@ -41,8 +54,9 @@ import asyncio
 import glob
 import json
 import mimetypes
+import shutil
 import urllib.parse
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 from chainlit.oauth_providers import get_oauth_provider
 from chainlit.secret import random_secret
@@ -118,6 +132,9 @@ async def lifespan(app: FastAPI):
             except asyncio.exceptions.CancelledError:
                 pass
 
+        if FILES_DIRECTORY.is_dir():
+            shutil.rmtree(FILES_DIRECTORY)
+
         # Force exit the process to avoid potential AnyIO threads still running
         os._exit(0)
 
@@ -134,6 +151,7 @@ def get_build_dir():
 
 
 build_dir = get_build_dir()
+
 
 app = FastAPI(lifespan=lifespan)
 
@@ -159,6 +177,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 SecWeb(app=app, Option={
        'csp': {'default-src': ["'self'", "http://localhost:9000/"],
                'frame-ancestors': ["'self'", "http://localhost:9000/"],
@@ -169,15 +188,10 @@ SecWeb(app=app, Option={
        'corp': {'Cross-Origin-Resource-Policy': 'same-site'},
        'xcdp': {'X-Permitted-Cross-Domain-Policies': 'all'}})
 
-
-# Define max HTTP data size to 100 MB
-max_message_size = 100 * 1024 * 1024
-
 socket = SocketManager(
     app,
     cors_allowed_origins=[],
     async_mode="asgi",
-    max_http_buffer_size=max_message_size,
 )
 
 
@@ -258,22 +272,33 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
             status_code=status.HTTP_400_BAD_REQUEST, detail="No auth_callback defined"
         )
 
-    app_user = await config.code.password_auth_callback(
+    user = await config.code.password_auth_callback(
         form_data.username, form_data.password
     )
 
-    if not app_user:
+    if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="credentialssignin",
         )
-    access_token = create_jwt(app_user)
-    if chainlit_client:
-        await chainlit_client.create_app_user(app_user=app_user)
+    access_token = create_jwt(user)
+    if data_layer := get_data_layer():
+        try:
+            await data_layer.create_user(user)
+        except Exception as e:
+            logger.error(f"Error creating user: {e}")
+
     return {
         "access_token": access_token,
         "token_type": "bearer",
     }
+
+
+@app.post("/logout")
+async def logout(request: Request, response: Response):
+    if config.code.on_logout:
+        return await config.code.on_logout(request, response)
+    return {"success": True}
 
 
 @app.post("/auth/header")
@@ -284,17 +309,21 @@ async def header_auth(request: Request):
             detail="No header_auth_callback defined",
         )
 
-    app_user = await config.code.header_auth_callback(request.headers)
+    user = await config.code.header_auth_callback(request.headers)
 
-    if not app_user:
+    if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Unauthorized",
         )
 
-    access_token = create_jwt(app_user)
-    if chainlit_client:
-        await chainlit_client.create_app_user(app_user=app_user)
+    access_token = create_jwt(user)
+    if data_layer := get_data_layer():
+        try:
+            await data_layer.create_user(user)
+        except Exception as e:
+            logger.error(f"Error creating user: {e}")
+
     return {
         "access_token": access_token,
         "token_type": "bearer",
@@ -329,7 +358,11 @@ async def oauth_login(provider_id: str, request: Request):
     response = RedirectResponse(
         url=f"{provider.authorize_url}?{params}",
     )
-    response.set_cookie("oauth_state", random, httponly=True, max_age=3 * 60)
+    samesite = os.environ.get("CHAINLIT_COOKIE_SAMESITE", "lax")  # type: Any
+    secure = samesite.lower() == 'none'
+    response.set_cookie(
+        "oauth_state", random, httponly=True, samesite=samesite, secure=secure, max_age=3 * 60
+    )
     return response
 
 
@@ -383,21 +416,25 @@ async def oauth_callback(
     url = get_user_facing_url(request.url)
     token = await provider.get_token(code, url)
 
-    (raw_user_data, default_app_user) = await provider.get_user_info(token)
+    (raw_user_data, default_user) = await provider.get_user_info(token)
 
-    app_user = await config.code.oauth_callback(
-        provider_id, token, raw_user_data, default_app_user
+    user = await config.code.oauth_callback(
+        provider_id, token, raw_user_data, default_user
     )
 
-    if not app_user:
+    if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Unauthorized",
         )
 
-    access_token = create_jwt(app_user)
-    if chainlit_client:
-        await chainlit_client.create_app_user(app_user=app_user)
+    access_token = create_jwt(user)
+
+    if data_layer := get_data_layer():
+        try:
+            await data_layer.create_user(user)
+        except Exception as e:
+            logger.error(f"Error creating user: {e}")
 
     params = urllib.parse.urlencode(
         {
@@ -413,23 +450,22 @@ async def oauth_callback(
     return response
 
 
-@app.post("/completion")
-async def completion(
-    request: CompletionRequest,
-    current_user: Annotated[
-        Union[AppUser, PersistedAppUser], Depends(get_current_user)
-    ],
+@app.post("/generation")
+async def generation(
+    request: GenerationRequest,
+    current_user: Annotated[Union[User, PersistedUser], Depends(get_current_user)],
 ):
     """Handle a completion request from the prompt playground."""
 
     providers = get_llm_providers()
 
     try:
-        provider = [p for p in providers if p.id == request.prompt.provider][0]
+        provider = [p for p in providers if p.id ==
+                    request.generation.provider][0]
     except IndexError:
         raise HTTPException(
             status_code=404,
-            detail=f"LLM provider '{request.prompt.provider}' not found",
+            detail=f"LLM provider '{request.generation.provider}' not found",
         )
 
     trace_event("pp_create_completion")
@@ -440,8 +476,8 @@ async def completion(
 
 @app.get("/project/llm-providers")
 async def get_providers(
-    current_user: Annotated[Union[AppUser,
-                                  PersistedAppUser], Depends(get_current_user)]
+    current_user: Annotated[Union[User, PersistedUser],
+                            Depends(get_current_user)]
 ):
     """List the providers."""
     trace_event("pp_get_llm_providers")
@@ -452,8 +488,8 @@ async def get_providers(
 
 @app.get("/project/settings")
 async def project_settings(
-    current_user: Annotated[Union[AppUser,
-                                  PersistedAppUser], Depends(get_current_user)]
+    current_user: Annotated[Union[User, PersistedUser],
+                            Depends(get_current_user)]
 ):
     """Return project settings. This is called by the UI before the establishing the websocket connection."""
     profiles = []
@@ -466,126 +502,178 @@ async def project_settings(
             "ui": config.ui.to_dict(),
             "features": config.features.to_dict(),
             "userEnv": config.project.user_env,
-            "dataPersistence": config.data_persistence,
+            "dataPersistence": get_data_layer() is not None,
+            "threadResumable": bool(config.code.on_chat_resume),
             "markdown": get_markdown_str(config.root),
             "chatProfiles": profiles,
         }
     )
 
 
-@app.put("/message/feedback")
+@app.put("/feedback")
 async def update_feedback(
     request: Request,
     update: UpdateFeedbackRequest,
-    current_user: Annotated[
-        Union[AppUser, PersistedAppUser], Depends(get_current_user)
-    ],
+    current_user: Annotated[Union[User, PersistedUser], Depends(get_current_user)],
 ):
     """Update the human feedback for a particular message."""
-
-    # todo check that message belong to a user's conversation
-
-    if not chainlit_client:
+    data_layer = get_data_layer()
+    if not data_layer:
         raise HTTPException(
-            status_code=400, detail="Data persistence is not enabled")
+            status_code=500, detail="Data persistence is not enabled")
 
-    await chainlit_client.set_human_feedback(
-        message_id=update.messageId,
-        feedback=update.feedback,
-        feedbackComment=update.feedbackComment,
-    )
-    return JSONResponse(content={"success": True})
+    try:
+        feedback_id = await data_layer.upsert_feedback(feedback=update.feedback)
+    except Exception as e:
+        raise HTTPException(detail=str(e), status_code=500)
+
+    return JSONResponse(content={"success": True, "feedbackId": feedback_id})
 
 
-@app.post("/project/conversations")
-async def get_user_conversations(
+@app.post("/project/threads")
+async def get_user_threads(
     request: Request,
-    payload: GetConversationsRequest,
-    current_user: Annotated[
-        Union[AppUser, PersistedAppUser], Depends(get_current_user)
-    ],
+    payload: GetThreadsRequest,
+    current_user: Annotated[Union[User, PersistedUser], Depends(get_current_user)],
 ):
-    """Get the conversations page by page."""
-    # Only show the current user conversations
+    """Get the threads page by page."""
+    # Only show the current user threads
 
-    if not chainlit_client:
+    data_layer = get_data_layer()
+
+    if not data_layer:
         raise HTTPException(
             status_code=400, detail="Data persistence is not enabled")
 
-    payload.filter.username = current_user.username
-    res = await chainlit_client.get_conversations(payload.pagination, payload.filter)
+    payload.filter.userIdentifier = current_user.identifier
+
+    res = await data_layer.list_threads(payload.pagination, payload.filter)
     return JSONResponse(content=res.to_dict())
 
 
-@app.get("/project/conversation/{conversation_id}")
-async def get_conversation(
+@app.get("/project/thread/{thread_id}")
+async def get_thread(
     request: Request,
-    conversation_id: str,
-    current_user: Annotated[
-        Union[AppUser, PersistedAppUser], Depends(get_current_user)
-    ],
+    thread_id: str,
+    current_user: Annotated[Union[User, PersistedUser], Depends(get_current_user)],
 ):
-    """Get a specific conversation."""
+    """Get a specific thread."""
+    data_layer = get_data_layer()
 
-    if not chainlit_client:
+    if not data_layer:
         raise HTTPException(
             status_code=400, detail="Data persistence is not enabled")
 
-    await is_conversation_author(current_user.username, conversation_id)
+    await is_thread_author(current_user.identifier, thread_id)
 
-    res = await chainlit_client.get_conversation(conversation_id)
+    res = await data_layer.get_thread(thread_id)
     return JSONResponse(content=res)
 
 
-@app.get("/project/conversation/{conversation_id}/element/{element_id}")
-async def get_conversation_element(
+@app.get("/project/thread/{thread_id}/element/{element_id}")
+async def get_thread_element(
     request: Request,
-    conversation_id: str,
+    thread_id: str,
     element_id: str,
-    current_user: Annotated[
-        Union[AppUser, PersistedAppUser], Depends(get_current_user)
-    ],
+    current_user: Annotated[Union[User, PersistedUser], Depends(get_current_user)],
 ):
-    """Get a specific conversation element."""
+    """Get a specific thread element."""
+    data_layer = get_data_layer()
 
-    if not chainlit_client:
+    if not data_layer:
         raise HTTPException(
             status_code=400, detail="Data persistence is not enabled")
 
-    await is_conversation_author(current_user.username, conversation_id)
+    await is_thread_author(current_user.identifier, thread_id)
 
-    res = await chainlit_client.get_element(conversation_id, element_id)
+    res = await data_layer.get_element(thread_id, element_id)
     return JSONResponse(content=res)
 
 
-@app.delete("/project/conversation")
-async def delete_conversation(
+@app.delete("/project/thread")
+async def delete_thread(
     request: Request,
-    payload: DeleteConversationRequest,
-    current_user: Annotated[
-        Union[AppUser, PersistedAppUser], Depends(get_current_user)
-    ],
+    payload: DeleteThreadRequest,
+    current_user: Annotated[Union[User, PersistedUser], Depends(get_current_user)],
 ):
-    """Delete a conversation."""
+    """Delete a thread."""
 
-    if not chainlit_client:
+    data_layer = get_data_layer()
+
+    if not data_layer:
         raise HTTPException(
             status_code=400, detail="Data persistence is not enabled")
 
-    conversation_id = payload.conversationId
+    thread_id = payload.threadId
 
-    await is_conversation_author(current_user.username, conversation_id)
+    await is_thread_author(current_user.identifier, thread_id)
 
-    await chainlit_client.delete_conversation(conversation_id)
+    await data_layer.delete_thread(thread_id)
     return JSONResponse(content={"success": True})
+
+
+@app.post("/project/file")
+async def upload_file(
+    session_id: str,
+    file: UploadFile,
+    current_user: Annotated[
+        Union[None, User, PersistedUser], Depends(get_current_user)
+    ],
+):
+    from chainlit.session import WebsocketSession
+
+    session = WebsocketSession.get_by_id(session_id)
+
+    if not session:
+        raise HTTPException(
+            status_code=404,
+            detail="Session not found",
+        )
+
+    if current_user:
+        if not session.user or session.user.identifier != current_user.identifier:
+            raise HTTPException(
+                status_code=401,
+                detail="You are not authorized to upload files for this session",
+            )
+
+    session.files_dir.mkdir(exist_ok=True)
+
+    content = await file.read()
+
+    file_response = await session.persist_file(
+        name=file.filename, content=content, mime=file.content_type
+    )
+
+    return JSONResponse(file_response)
+
+
+@app.get("/project/file/{file_id}")
+async def get_file(
+    file_id: str,
+    session_id: Optional[str] = None,
+):
+    from chainlit.session import WebsocketSession
+
+    session = WebsocketSession.get_by_id(session_id) if session_id else None
+
+    if not session:
+        raise HTTPException(
+            status_code=404,
+            detail="Session not found",
+        )
+
+    if file_id in session.files:
+        file = session.files[file_id]
+        return FileResponse(file["path"], media_type=file["type"])
+    else:
+        raise HTTPException(status_code=404, detail="File not found")
 
 
 @app.get("/files/{filename:path}")
 async def serve_file(
     filename: str,
-    current_user: Annotated[
-        Union[AppUser, PersistedAppUser], Depends(get_current_user)
-    ],
+    current_user: Annotated[Union[User, PersistedUser], Depends(get_current_user)],
 ):
     base_path = Path(config.project.local_fs_path).resolve()
     file_path = (base_path / filename).resolve()

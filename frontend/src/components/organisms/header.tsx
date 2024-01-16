@@ -1,3 +1,4 @@
+import { useAuth } from 'api/auth';
 import { memo, useRef, useState } from 'react';
 import { Link, useLocation } from 'react-router-dom';
 
@@ -13,18 +14,16 @@ import {
 } from '@mui/material';
 import useMediaQuery from '@mui/material/useMediaQuery';
 
-import { RegularButton } from '@chainlit/components';
+import { RegularButton } from '@chainlit/react-components';
 
 import GithubButton from 'components/atoms/buttons/githubButton';
 import UserButton from 'components/atoms/buttons/userButton';
 import { Logo } from 'components/atoms/logo';
 import NewChatButton from 'components/molecules/newChatButton';
 
-import { useAuth } from 'hooks/auth';
-
 import { IProjectSettings } from 'state/project';
 
-import OpenChatHistoryButton from './conversationsHistory/sidebar/OpenChatHistoryButton';
+import { OpenThreadListButton } from './threadHistory/sidebar/OpenThreadListButton';
 
 interface INavItem {
   to: string;
@@ -106,9 +105,7 @@ const Nav = ({ dataPersistence, hasReadme, matches }: NavProps) => {
         >
           <MenuIcon />
         </IconButton>
-        {isAuthenticated && dataPersistence ? (
-          <OpenChatHistoryButton mode="mobile" />
-        ) : null}
+        {isAuthenticated && dataPersistence ? <OpenThreadListButton /> : null}
         <Menu
           autoFocus
           anchorEl={anchorEl}
@@ -157,7 +154,7 @@ const Header = memo(
             borderBottomColor: (theme) => theme.palette.divider
           }}
         >
-          <Stack alignItems="center" direction={'row'} gap={!matches ? 3 : 1}>
+          <Stack alignItems="center" direction={'row'} gap={!matches ? 3 : 0}>
             {!matches ? <Logo style={{ maxHeight: '25px' }} /> : null}
             <Nav
               matches={matches}

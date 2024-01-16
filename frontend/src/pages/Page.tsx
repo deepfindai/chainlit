@@ -1,18 +1,11 @@
-import {
-  Navigate,
-  NavigateOptions,
-  useNavigate,
-  useSearchParams
-} from 'react-router-dom';
+import { useAuth } from 'api/auth';
+import { Navigate } from 'react-router-dom';
 import { useRecoilValue } from 'recoil';
 
 import { Alert, Box, Stack } from '@mui/material';
 
-import { ConversationsHistorySidebar } from 'components/organisms/conversationsHistory/sidebar';
-import OpenChatHistoryButton from 'components/organisms/conversationsHistory/sidebar/OpenChatHistoryButton';
 import { Header } from 'components/organisms/header';
-
-import { useAuth } from 'hooks/auth';
+import { ThreadHistorySideBar } from 'components/organisms/threadHistory/sidebar';
 
 import { projectSettingsState } from 'state/project';
 import { userEnvState } from 'state/user';
@@ -54,8 +47,7 @@ const Page = ({ children }: Props) => {
         <Alert severity="error">You are not part of this project.</Alert>
       ) : (
         <Stack direction="row" height="100%" width="100%" overflow="auto">
-          <ConversationsHistorySidebar />
-          <OpenChatHistoryButton mode={'desktop'} />
+          <ThreadHistorySideBar />
           {children}
         </Stack>
       )}

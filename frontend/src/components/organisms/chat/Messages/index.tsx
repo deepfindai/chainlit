@@ -1,8 +1,20 @@
+import { apiClient } from 'api';
+import { useCallback } from 'react';
+import { useRecoilValue, useSetRecoilState } from 'recoil';
+import { toast } from 'sonner';
+
 import {
+  IAction,
+  IFeedback,
+  IStep,
+  accessTokenState,
+  messagesState,
+  updateMessageById,
   useChatData,
   useChatInteract,
-  useChatMessages
-} from '@chainlit/components';
+  useChatMessages,
+  useChatSession
+} from '@chainlit/react-client';
 
 import { IProjectSettings } from 'state/project';
 
@@ -23,9 +35,73 @@ const Messages = ({
   const { elements, askUser, avatars, loading, actions } = useChatData();
   const { messages } = useChatMessages();
   const { callAction } = useChatInteract();
+  const { idToResume } = useChatSession();
+  const accessToken = useRecoilValue(accessTokenState);
+  const setMessages = useSetRecoilState(messagesState);
 
-  return !messages.length && projectSettings?.ui.show_readme_as_default ? (
-    <WelcomeScreen markdown={projectSettings?.markdown} />
+  const callActionWithToast = useCallback(
+    (action: IAction) => {
+      const promise = callAction(action);
+      if (promise) {
+        toast.promise(promise, {
+          loading: `Running ${action.name}`,
+          success: (res) => {
+            if (res.response) {
+              return res.response;
+            } else {
+              return `${action.name} executed successfully`;
+            }
+          },
+          error: (res) => {
+            if (res.response) {
+              return res.response;
+            } else {
+              return `${action.name} failed`;
+            }
+          }
+        });
+      }
+    },
+    [callAction]
+  );
+
+  const onFeedbackUpdated = useCallback(
+    async (message: IStep, onSuccess: () => void, feedback: IFeedback) => {
+      try {
+        toast.promise(apiClient.setFeedback(feedback, accessToken), {
+          loading: 'Updating',
+          success: (res) => {
+            setMessages((prev) =>
+              updateMessageById(prev, message.id, {
+                ...message,
+                feedback: {
+                  ...feedback,
+                  id: res.feedbackId
+                }
+              })
+            );
+            onSuccess();
+            return 'Feedback updated!';
+          },
+          error: (err) => {
+            return <span>{err.message}</span>;
+          }
+        });
+      } catch (err) {
+        console.log(err);
+      }
+    },
+    []
+  );
+
+  return !idToResume &&
+    !messages.length &&
+    projectSettings?.ui.show_readme_as_default ? (
+    <WelcomeScreen
+      markdown={projectSettings?.markdown}
+      allowHtml={projectSettings?.features?.unsafe_allow_html}
+      latex={projectSettings?.features?.latex}
+    />
   ) : (
     <MessageContainer
       avatars={avatars}
@@ -35,7 +111,8 @@ const Messages = ({
       elements={elements}
       messages={messages}
       autoScroll={autoScroll}
-      callAction={callAction}
+      onFeedbackUpdated={onFeedbackUpdated}
+      callAction={callActionWithToast}
       setAutoScroll={setAutoScroll}
     />
   );

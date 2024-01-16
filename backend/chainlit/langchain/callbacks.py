@@ -1,15 +1,16 @@
-import asyncio
-import json
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Union
 from uuid import UUID
 
 from chainlit.context import context_var
 from chainlit.message import Message
-from chainlit.prompt import Prompt, PromptMessage
+from chainlit.playground.providers.openai import stringify_function_call
+from chainlit.step import Step, TrueStepType
 from langchain.callbacks.tracers.base import BaseTracer
 from langchain.callbacks.tracers.schemas import Run
-from langchain.schema.messages import BaseMessage
+from langchain.schema import BaseMessage
 from langchain.schema.output import ChatGenerationChunk, GenerationChunk
+from literalai import ChatGeneration, CompletionGeneration, GenerationMessage
 
 DEFAULT_ANSWER_PREFIX_TOKENS = ["Final", "Answer", ":"]
 
@@ -86,15 +87,15 @@ class FinalStreamHelper:
             self.last_tokens_stripped.pop(0)
 
 
-class PromptHelper:
-    prompt_sequence: List[Prompt]
+class GenerationHelper:
+    generation_sequence: List[Union[ChatGeneration, CompletionGeneration]]
 
     def __init__(self) -> None:
-        self.prompt_sequence = []
+        self.generation_sequence = []
 
     @property
-    def current_prompt(self):
-        return self.prompt_sequence[-1] if self.prompt_sequence else None
+    def current_generation(self):
+        return self.generation_sequence[-1] if self.generation_sequence else None
 
     def _convert_message_role(self, role: str):
         if "human" in role.lower():
@@ -110,16 +111,16 @@ class PromptHelper:
         self,
         message: Dict,
         template: Optional[str] = None,
-        template_format: Optional[str] = None,
+        template_format: str = "f-string",
     ):
         class_name = message["id"][-1]
         kwargs = message.get("kwargs", {})
         function_call = kwargs.get("additional_kwargs", {}).get("function_call")
         if function_call:
-            content = json.dumps(function_call, indent=4)
+            content = stringify_function_call(function_call)
         else:
             content = kwargs.get("content", "")
-        return PromptMessage(
+        return GenerationMessage(
             name=kwargs.get("name"),
             role=self._convert_message_role(class_name),
             template=template,
@@ -131,7 +132,7 @@ class PromptHelper:
         self,
         message: Union[Dict, BaseMessage],
         template: Optional[str] = None,
-        template_format: Optional[str] = None,
+        template_format: str = "f-string",
     ):
         if isinstance(message, dict):
             return self._convert_message_dict(
@@ -139,10 +140,10 @@ class PromptHelper:
             )
         function_call = message.additional_kwargs.get("function_call")
         if function_call:
-            content = json.dumps(function_call, indent=4)
+            content = stringify_function_call(function_call)
         else:
             content = message.content
-        return PromptMessage(
+        return GenerationMessage(
             name=getattr(message, "name", None),
             role=self._convert_message_role(message.type),
             template=template,
@@ -166,16 +167,16 @@ class PromptHelper:
 
             return chain_messages
 
-    def _build_prompt(self, serialized: Dict, inputs: Dict):
+    def _build_generation(self, serialized: Dict, inputs: Dict):
         messages = self._get_messages(serialized)
         if messages:
             # If prompt is chat, the formatted values will be added in on_chat_model_start
-            self._build_chat_template_prompt(messages, inputs)
+            self._build_chat_template_generation(messages, inputs)
         else:
             # For completion prompt everything is done here
-            self._build_completion_prompt(serialized, inputs)
+            self._build_completion_generation(serialized, inputs)
 
-    def _build_completion_prompt(self, serialized: Dict, inputs: Dict):
+    def _build_completion_generation(self, serialized: Dict, inputs: Dict):
         if not serialized:
             return
         kwargs = serialized.get("kwargs", {})
@@ -183,15 +184,18 @@ class PromptHelper:
         template_format = kwargs.get("template_format")
         stringified_inputs = {k: str(v) for (k, v) in inputs.items()}
 
-        self.prompt_sequence.append(
-            Prompt(
+        if not template:
+            return
+
+        self.generation_sequence.append(
+            CompletionGeneration(
                 template=template,
                 template_format=template_format,
                 inputs=stringified_inputs,
             )
         )
 
-    def _build_default_prompt(
+    def _build_default_generation(
         self,
         run: Run,
         generation_type: str,
@@ -201,12 +205,12 @@ class PromptHelper:
     ):
         """Build a prompt once an LLM has been executed if no current prompt exists (without template)"""
         if "chat" in generation_type.lower():
-            return Prompt(
+            return ChatGeneration(
                 provider=provider,
                 settings=llm_settings,
                 completion=completion,
                 messages=[
-                    PromptMessage(
+                    GenerationMessage(
                         formatted=formatted_prompt,
                         role=self._convert_message_role(formatted_prompt.split(":")[0]),
                     )
@@ -214,16 +218,16 @@ class PromptHelper:
                 ],
             )
         else:
-            return Prompt(
+            return CompletionGeneration(
                 provider=provider,
                 settings=llm_settings,
                 completion=completion,
                 formatted=run.inputs.get("prompts", [])[0],
             )
 
-    def _build_chat_template_prompt(self, lc_messages: List[Dict], inputs: Dict):
-        def build_template_messages() -> List[PromptMessage]:
-            template_messages = []  # type: List[PromptMessage]
+    def _build_chat_template_generation(self, lc_messages: List[Dict], inputs: Dict):
+        def build_template_messages() -> List[GenerationMessage]:
+            template_messages = []  # type: List[GenerationMessage]
 
             if not lc_messages:
                 return template_messages
@@ -239,18 +243,20 @@ class PromptHelper:
                 if "placeholder" in class_name.lower():
                     variable_name = lc_message.get(
                         "variable_name"
+                    ) or message_kwargs.get(
+                        "variable_name"
                     )  # type: Optional[str]
                     variable = inputs.get(variable_name, [])
                     placeholder_size = len(variable)
+
                     if placeholder_size:
                         template_messages += [
-                            PromptMessage(placeholder_size=placeholder_size)
+                            GenerationMessage(placeholder_size=placeholder_size)
                         ]
                 else:
                     template_messages += [
-                        PromptMessage(
+                        GenerationMessage(
                             template=template,
-                            template_format=template_format,
                             role=self._convert_message_role(class_name),
                         )
                     ]
@@ -258,19 +264,22 @@ class PromptHelper:
 
         template_messages = build_template_messages()
 
-        stringified_inputs = {k: str(v) for (k, v) in inputs.items()}
-        self.prompt_sequence.append(
-            Prompt(messages=template_messages, inputs=stringified_inputs)
-        )
-
-    def _build_chat_formatted_prompt(
-        self, lc_messages: Union[List[BaseMessage], List[dict]]
-    ):
-        if not self.current_prompt:
+        if not template_messages:
             return
 
-        formatted_messages = []  # type: List[PromptMessage]
-        if self.current_prompt.messages:
+        stringified_inputs = {k: str(v) for (k, v) in inputs.items()}
+        self.generation_sequence.append(
+            ChatGeneration(messages=template_messages, inputs=stringified_inputs)
+        )
+
+    def _build_chat_formatted_generation(
+        self, lc_messages: Union[List[BaseMessage], List[dict]]
+    ):
+        if not self.current_generation:
+            return
+
+        formatted_messages = []  # type: List[GenerationMessage]
+        if self.current_generation.messages:
             # This is needed to compute the correct message index to read
             placeholder_offset = 0
             # The final list of messages
@@ -278,7 +287,7 @@ class PromptHelper:
             # Looping the messages built in build_prompt
             # They only contain the template
             for template_index, template_message in enumerate(
-                self.current_prompt.messages
+                self.current_generation.messages
             ):
                 # If a message has a placeholder size, we need to replace it
                 # With the N following messages, where N is the placeholder size
@@ -314,7 +323,7 @@ class PromptHelper:
                 self._convert_message(lc_message) for lc_message in lc_messages
             ]
 
-        self.current_prompt.messages = formatted_messages
+        self.current_generation.messages = formatted_messages
 
     def _build_llm_settings(
         self,
@@ -344,18 +353,31 @@ class PromptHelper:
         return provider, settings
 
 
-class LangchainTracer(BaseTracer, PromptHelper, FinalStreamHelper):
-    llm_stream_message: Dict[str, Message]
+DEFAULT_TO_IGNORE = ["RunnableSequence", "RunnableParallel", "<lambda>"]
+DEFAULT_TO_KEEP = ["retriever", "llm", "agent", "chain", "tool"]
+
+
+class LangchainTracer(BaseTracer, GenerationHelper, FinalStreamHelper):
+    steps: Dict[str, Step]
+    parent_id_map: Dict[str, str]
+    ignored_runs: set
 
     def __init__(
         self,
+        # Token sequence that prefixes the answer
         answer_prefix_tokens: Optional[List[str]] = None,
+        # Should we stream the final answer?
         stream_final_answer: bool = False,
+        # Should force stream the first response?
         force_stream_final_answer: bool = False,
+        # Runs to ignore to enhance readability
+        to_ignore: Optional[List[str]] = None,
+        # Runs to keep within ignored runs
+        to_keep: Optional[List[str]] = None,
         **kwargs: Any,
     ) -> None:
         BaseTracer.__init__(self, **kwargs)
-        PromptHelper.__init__(self)
+        GenerationHelper.__init__(self)
         FinalStreamHelper.__init__(
             self,
             answer_prefix_tokens=answer_prefix_tokens,
@@ -363,13 +385,91 @@ class LangchainTracer(BaseTracer, PromptHelper, FinalStreamHelper):
             force_stream_final_answer=force_stream_final_answer,
         )
         self.context = context_var.get()
-        self.llm_stream_message = {}
+        self.steps = {}
+        self.parent_id_map = {}
+        self.ignored_runs = set()
+
+        if self.context.current_step:
+            self.root_parent_id = self.context.current_step.id
+        elif self.context.session.root_message:
+            self.root_parent_id = self.context.session.root_message.id
+        else:
+            self.root_parent_id = None
+
+        if to_ignore is None:
+            self.to_ignore = DEFAULT_TO_IGNORE
+        else:
+            self.to_ignore = to_ignore
+
+        if to_keep is None:
+            self.to_keep = DEFAULT_TO_KEEP
+        else:
+            self.to_keep = to_keep
 
     def _run_sync(self, co):
-        asyncio.run_coroutine_threadsafe(co, loop=self.context.loop)
+        context_var.set(self.context)
+        self.context.loop.create_task(co)
 
     def _persist_run(self, run: Run) -> None:
         pass
+
+    def _get_run_parent_id(self, run: Run):
+        parent_id = str(run.parent_run_id) if run.parent_run_id else self.root_parent_id
+
+        return parent_id
+
+    def _get_non_ignored_parent_id(self, current_parent_id: Optional[str] = None):
+        if not current_parent_id:
+            return self.root_parent_id
+
+        if current_parent_id not in self.parent_id_map:
+            return None
+
+        while current_parent_id in self.parent_id_map:
+            # If the parent id is in the ignored runs, we need to get the parent id of the ignored run
+            if current_parent_id in self.ignored_runs:
+                current_parent_id = self.parent_id_map[current_parent_id]
+            else:
+                return current_parent_id
+
+        return self.root_parent_id
+
+    def _should_ignore_run(self, run: Run):
+        parent_id = self._get_run_parent_id(run)
+
+        if parent_id:
+            # Add the parent id of the ignored run in the mapping
+            # so we can re-attach a kept child to the right parent id
+            self.parent_id_map[str(run.id)] = parent_id
+
+        ignore_by_name = run.name in self.to_ignore
+        ignore_by_parent = parent_id in self.ignored_runs
+
+        ignore = ignore_by_name or ignore_by_parent
+
+        # If the ignore cause is the parent being ignored, check if we should nonetheless keep the child
+        if ignore_by_parent and not ignore_by_name and run.run_type in self.to_keep:
+            return False, self._get_non_ignored_parent_id(parent_id)
+        else:
+            if ignore:
+                # Tag the run as ignored
+                self.ignored_runs.add(str(run.id))
+            return ignore, parent_id
+
+    def _is_annotable(self, run: Run):
+        return run.run_type in ["retriever", "llm"]
+
+    def _get_completion(self, generation: Dict):
+        if message := generation.get("message"):
+            kwargs = message.get("kwargs", {})
+            if function_call := kwargs.get("additional_kwargs", {}).get(
+                "function_call"
+            ):
+                return stringify_function_call(function_call), "json"
+            else:
+                return kwargs.get("content", ""), None
+        else:
+            return generation.get("text", ""), None
 
     def on_chat_model_start(
         self,
@@ -384,12 +484,12 @@ class LangchainTracer(BaseTracer, PromptHelper, FinalStreamHelper):
     ) -> Any:
         """Adding formatted content and new message to the previously built template prompt"""
         lc_messages = messages[0]
-        if not self.current_prompt:
-            self.prompt_sequence.append(
-                Prompt(messages=[self._convert_message(m) for m in lc_messages])
+        if not self.current_generation:
+            self.generation_sequence.append(
+                ChatGeneration(messages=[self._convert_message(m) for m in lc_messages])
             )
         else:
-            self._build_chat_formatted_prompt(lc_messages)
+            self._build_chat_formatted_generation(lc_messages)
 
         super().on_chat_model_start(
             serialized,
@@ -410,7 +510,7 @@ class LangchainTracer(BaseTracer, PromptHelper, FinalStreamHelper):
         parent_run_id: Optional[UUID] = None,
         **kwargs: Any,
     ) -> Any:
-        msg = self.llm_stream_message.get(str(run_id), None)
+        msg = self.steps.get(str(run_id), None)
         if msg:
             self._run_sync(msg.stream_token(token))
 
@@ -420,6 +520,7 @@ class LangchainTracer(BaseTracer, PromptHelper, FinalStreamHelper):
             if self.answer_reached:
                 if not self.final_stream:
                     self.final_stream = Message(content="")
+                    self._run_sync(self.final_stream.send())
                 self._run_sync(self.final_stream.stream_token(token))
                 self.has_streamed_final_answer = True
             else:
@@ -436,103 +537,124 @@ class LangchainTracer(BaseTracer, PromptHelper, FinalStreamHelper):
 
     def _start_trace(self, run: Run) -> None:
         super()._start_trace(run)
-
         context_var.set(self.context)
-        root_message_id = (
-            self.context.session.root_message.id
-            if self.context.session.root_message
-            else None
-        )
-        parent_id = str(run.parent_run_id) if run.parent_run_id else root_message_id
+
         if run.run_type in ["chain", "prompt"]:
             # Prompt templates are contained in chains or prompts (lcel)
-            self._build_prompt(run.serialized or {}, run.inputs)
+            self._build_generation(run.serialized or {}, run.inputs)
 
-        if run.run_type == "llm":
-            msg = Message(
-                id=run.id,
-                content="",
-                author=run.name,
-                parent_id=parent_id,
-            )
-            self.llm_stream_message[str(run.id)] = msg
-            self._run_sync(msg.send())
+        ignore, parent_id = self._should_ignore_run(run)
+
+        if ignore:
             return
 
-        content = run.inputs
+        step_type: TrueStepType = "undefined"
 
-        self._run_sync(
-            Message(
-                id=run.id,
-                content=content,
-                language="json",
-                author=run.name,
-                parent_id=parent_id,
-            ).send()
+        if run.run_type in ["agent", "chain"]:
+            step_type = "run"
+        elif run.run_type == "llm":
+            step_type = "llm"
+        elif run.run_type == "retriever":
+            step_type = "retrieval"
+        elif run.run_type == "tool":
+            step_type = "tool"
+        elif run.run_type == "embedding":
+            step_type = "embedding"
+
+        disable_feedback = not self._is_annotable(run)
+
+        step = Step(
+            id=str(run.id),
+            name=run.name,
+            type=step_type,
+            parent_id=parent_id,
+            disable_feedback=disable_feedback,
         )
+        step.start = datetime.utcnow().isoformat()
+        step.input = run.inputs
+
+        self.steps[str(run.id)] = step
+
+        self._run_sync(step.send())
 
     def _on_run_update(self, run: Run) -> None:
         """Process a run upon update."""
         context_var.set(self.context)
 
-        root_message_id = (
-            self.context.session.root_message.id
-            if self.context.session.root_message
-            else None
-        )
-        parent_id = str(run.parent_run_id) if run.parent_run_id else root_message_id
+        ignore, parent_id = self._should_ignore_run(run)
+
+        if ignore:
+            return
+
+        current_step = self.steps.get(str(run.id), None)
 
         if run.run_type in ["chain"]:
-            if self.prompt_sequence:
-                self.prompt_sequence.pop()
+            if self.generation_sequence:
+                self.generation_sequence.pop()
 
         if run.run_type == "llm":
             provider, llm_settings = self._build_llm_settings(
                 (run.serialized or {}), (run.extra or {}).get("invocation_params")
             )
             generations = (run.outputs or {}).get("generations", [])
-            completion = generations[0][0]["text"]
-            generation_type = generations[0][0]["type"]
-
-            current_prompt = (
-                self.prompt_sequence.pop() if self.prompt_sequence else None
+            llm_output = (run.outputs or {}).get("llm_output")
+            completion, language = self._get_completion(generations[0][0])
+            current_generation = (
+                self.generation_sequence.pop() if self.generation_sequence else None
             )
 
-            if current_prompt:
-                current_prompt.provider = provider
-                current_prompt.settings = llm_settings
-                current_prompt.completion = completion
+            if current_generation:
+                current_generation.provider = provider
+                current_generation.settings = llm_settings
+                current_generation.completion = completion
             else:
-                current_prompt = self._build_default_prompt(
+                generation_type = generations[0][0].get("type", "")
+                current_generation = self._build_default_generation(
                     run, generation_type, provider, llm_settings, completion
                 )
-            msg = self.llm_stream_message.get(str(run.id), None)
-            if msg:
-                msg.content = completion
-                msg.prompt = current_prompt
-                self._run_sync(msg.update())
+
+            if llm_output and current_generation:
+                token_count = llm_output.get("token_usage", {}).get("total_tokens")
+                current_generation.token_count = token_count
+
+            if current_step:
+                current_step.output = completion
+                current_step.language = language
+                current_step.end = datetime.utcnow().isoformat()
+                current_step.generation = current_generation
+                self._run_sync(current_step.update())
+
+            if self.final_stream and self.has_streamed_final_answer:
+                self.final_stream.content = completion
+                self.final_stream.language = language
+                self._run_sync(self.final_stream.update())
+
             return
 
-        if run.run_type in ["agent", "chain", "tool"]:
-            # Add the response of the chain/tool
-            self._run_sync(
-                Message(
-                    content=run.outputs or {},
-                    language="json",
-                    author=run.name,
-                    parent_id=parent_id,
-                ).send()
-            )
-        else:
-            self._run_sync(
-                Message(
-                    id=run.id,
-                    content=run.outputs or {},
-                    language="json",
-                    author=run.name,
-                    parent_id=parent_id,
-                ).update()
-            )
+        outputs = run.outputs or {}
+        output_keys = list(outputs.keys())
+        output = outputs
+        if output_keys:
+            output = outputs.get(output_keys[0], outputs)
+
+        if current_step:
+            current_step.output = output
+            current_step.end = datetime.utcnow().isoformat()
+            self._run_sync(current_step.update())
+
+    def _on_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any):
+        context_var.set(self.context)
+
+        if current_step := self.steps.get(str(run_id), None):
+            current_step.is_error = True
+            current_step.output = str(error)
+            current_step.end = datetime.utcnow().isoformat()
+            self._run_sync(current_step.update())
+
+    on_llm_error = _on_error
+    on_chain_error = _on_error
+    on_tool_error = _on_error
+    on_retriever_error = _on_error
 
 
 LangchainCallbackHandler = LangchainTracer

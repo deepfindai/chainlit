@@ -1,28 +1,34 @@
-import { ChainlitAPI } from 'api/chainlitApi';
+import { apiClient } from 'api';
 import { useCallback } from 'react';
-import { toast } from 'react-hot-toast';
 import { useRecoilState, useRecoilValue } from 'recoil';
+import { toast } from 'sonner';
 
+import { IGeneration, accessTokenState } from '@chainlit/react-client';
 import {
   IPlaygroundContext,
-  IPrompt,
   PromptPlayground
-} from '@chainlit/components';
+} from '@chainlit/react-components';
 
 import { useLLMProviders } from 'hooks/useLLMProviders';
 
-import { modeState, playgroundState, variableState } from 'state/playground';
-import { accessTokenState, userEnvState } from 'state/user';
+import {
+  functionState,
+  modeState,
+  playgroundState,
+  variableState
+} from 'state/playground';
+import { userEnvState } from 'state/user';
 
 export default function PlaygroundWrapper() {
   const accessToken = useRecoilValue(accessTokenState);
   const userEnv = useRecoilValue(userEnvState);
   const [variableName, setVariableName] = useRecoilState(variableState);
+  const [functionIndex, setFunctionIndex] = useRecoilState(functionState);
   const [playground, setPlayground] = useRecoilState(playgroundState);
   const [promptMode, setPromptMode] = useRecoilState(modeState);
 
   const shoulFetchProviders =
-    playground?.prompt && !playground?.providers?.length;
+    playground?.generation && !playground?.providers?.length;
 
   useLLMProviders(shoulFetchProviders);
 
@@ -44,12 +50,12 @@ export default function PlaygroundWrapper() {
 
   const createCompletion = useCallback(
     (
-      prompt: IPrompt,
+      generation: IGeneration,
       controller: AbortController,
       cb: (done: boolean, token: string) => void
     ) => {
-      return ChainlitAPI.getCompletion(
-        prompt,
+      return apiClient.getGeneration(
+        generation,
         userEnv,
         controller,
         accessToken,
@@ -60,19 +66,19 @@ export default function PlaygroundWrapper() {
   );
 
   return (
-    <>
-      <PromptPlayground
-        context={{
-          setVariableName,
-          variableName,
-          setPlayground,
-          playground,
-          onNotification,
-          createCompletion,
-          promptMode,
-          setPromptMode
-        }}
-      />
-    </>
+    <PromptPlayground
+      context={{
+        setFunctionIndex,
+        functionIndex,
+        setVariableName,
+        variableName,
+        setPlayground,
+        playground,
+        onNotification,
+        createCompletion,
+        promptMode,
+        setPromptMode
+      }}
+    />
   );
 }

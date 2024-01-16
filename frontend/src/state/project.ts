@@ -1,6 +1,6 @@
 import { atom } from 'recoil';
 
-import { IMessage, IMessageElement } from '@chainlit/components';
+import { IMessageElement, IStep } from '@chainlit/react-client';
 
 export interface ChatProfile {
   icon: string;
@@ -21,6 +21,8 @@ export interface IProjectSettings {
   };
   features: {
     multi_modal?: boolean;
+    unsafe_allow_html?: boolean;
+    latex?: boolean;
     speech_to_text?: {
       enabled?: boolean;
       language?: string;
@@ -28,6 +30,7 @@ export interface IProjectSettings {
   };
   userEnv: string[];
   dataPersistence: boolean;
+  threadResumable: boolean;
   chatProfiles: ChatProfile[];
 }
 
@@ -36,17 +39,12 @@ export const projectSettingsState = atom<IProjectSettings | undefined>({
   default: undefined
 });
 
-export const chatProfile = atom<string | undefined>({
-  key: 'ChatProfile',
-  default: undefined
-});
-
 export const sideViewState = atom<IMessageElement | undefined>({
   key: 'SideView',
   default: undefined
 });
 
-export const highlightMessage = atom<IMessage['id'] | null>({
+export const highlightMessage = atom<IStep['id'] | null>({
   key: 'HighlightMessage',
   default: null
 });

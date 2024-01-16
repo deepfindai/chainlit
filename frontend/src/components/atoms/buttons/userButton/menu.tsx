@@ -1,3 +1,4 @@
+import { useAuth } from 'api/auth';
 import { Link } from 'react-router-dom';
 import { useRecoilValue, useSetRecoilState } from 'recoil';
 
@@ -13,8 +14,6 @@ import {
   MenuItem,
   Typography
 } from '@mui/material';
-
-import { useAuth } from 'hooks/auth';
 
 import { projectSettingsState } from 'state/project';
 import { settingsState } from 'state/settings';
@@ -37,7 +36,7 @@ export default function UserMenu({ anchorEl, open, handleClose }: Props) {
         {user.id}
       </Typography>
       <Typography width="100%" fontSize="13px" fontWeight={400}>
-        {user.username}
+        {user.identifier}
       </Typography>
     </ListItem>
   );
